@@ -62,8 +62,9 @@ const authenticate = async (req, res, next) => {
 };
 
 // Check if user is admin
+// Check if user is admin (case-insensitive)
 const isAdmin = (req, res, next) => {
-    if (req.user && req.user.role === 'Admin') {
+    if (req.user && req.user.role && req.user.role.toLowerCase() === 'admin') {
         next();
     } else {
         res.status(403).json({
