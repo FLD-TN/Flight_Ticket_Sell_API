@@ -119,7 +119,7 @@ exports.register = async (req, res, next) => {
     }
 };
 
-// Login user
+// đăng nhập của user
 exports.login = async (req, res, next) => {
     try {
         const { error, value } = loginSchema.validate(req.body);
@@ -134,7 +134,7 @@ exports.login = async (req, res, next) => {
 
         const pool = await getPool();
 
-        // Find user by email or username
+        // Tìm user thông qua email hoặc username
         const result = await pool.request()
             .input('identifier', sql.NVarChar, emailOrUsername)
             .query(`

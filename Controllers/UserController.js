@@ -40,7 +40,6 @@ exports.getAllUsers = async (req, res, next) => {
             whereClause += ` AND UserRole = @role`;
             request.input('role', sql.NVarChar, role);
         }
-
         const result = await request.query(`
       SELECT UserID, Username, FullName, Email, PhoneNumber, UserRole, Avatar, CreatedDate, UpdatedDate
       FROM [User]
