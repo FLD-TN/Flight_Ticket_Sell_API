@@ -6,7 +6,7 @@ const orderSchema = Joi.object({
     ticketId: Joi.number().integer().required(),
     addressDelivery: Joi.string().required(),
     paymentMethod: Joi.string().valid('Credit Card', 'MoMo', 'VNPAY', 'Cash').required()
-});
+}).unknown(true);
 
 // Create order
 exports.createOrder = async (req, res, next) => {
@@ -180,14 +180,14 @@ exports.getOrderById = async (req, res, next) => {
         const result = await pool.request()
             .input('orderId', sql.Int, id)
             .query(`
-        SELECT 
-          o.OrderID, o.UserID, o.OrderDate, o.TotalAmount, o.PaymentStatus,
-          o.AddressDelivery, o.PaymentMethod, o.OrderStatus, o.CreatedDate,
-          u.Username, u.FullName, u.Email, u.PhoneNumber
-        FROM [Order] o
-        INNER JOIN [User] u ON o.UserID = u.UserID
-        WHERE o.OrderID = @orderId AND (o.IsDeleted = 0 OR o.IsDeleted IS NULL)
-      `);
+                SELECT 
+                  o.OrderID, o.UserID, o.OrderDate, o.TotalAmount, o.PaymentStatus,
+                  o.AddressDelivery, o.PaymentMethod, o.OrderStatus, o.CreatedDate,
+                  u.Username, u.FullName, u.Email, u.PhoneNumber
+                FROM [Order] o
+                INNER JOIN [User] u ON o.UserID = u.UserID
+                WHERE o.OrderID = @orderId AND (o.IsDeleted = 0 OR o.IsDeleted IS NULL)
+            `);
 
         if (result.recordset.length === 0) {
             return res.status(404).json({
@@ -210,21 +210,34 @@ exports.getOrderById = async (req, res, next) => {
         const detailsResult = await pool.request()
             .input('orderId', sql.Int, id)
             .query(`
-        SELECT 
-          od.OrderDetailID, od.OrderID, od.TicketID, od.Quantity, od.UnitPrice, od.Discount, od.TotalPrice,
-          t.SeatNumber, t.TicketType, t.TicketStatus,
-          f.FlightNumber, f.DepartureAirport, f.ArrivalAirport, f.DepartureTime, f.ArrivalTime
-        FROM [OrderDetail] od
-        INNER JOIN [Ticket] t ON od.TicketID = t.TicketID
-        INNER JOIN [FlightList] f ON t.FlightID = f.FlightID
-        WHERE od.OrderID = @orderId
-      `);
+                SELECT 
+                  od.OrderDetailID, od.OrderID, od.TicketID, od.Quantity, od.UnitPrice, od.Discount, od.TotalPrice,
+                  t.SeatNumber, t.TicketType, t.TicketStatus,
+                  f.FlightNumber, f.DepartureAirport, f.ArrivalAirport, f.DepartureTime, f.ArrivalTime
+                FROM [OrderDetail] od
+                INNER JOIN [Ticket] t ON od.TicketID = t.TicketID
+                INNER JOIN [FlightList] f ON t.FlightID = f.FlightID
+                WHERE od.OrderID = @orderId
+            `);
 
+        const ticketId = detailsResult.recordset[0]?.TicketID;
+        let passengerResult = { recordset: [] };
+
+        if (ticketId) {
+            passengerResult = await pool.request()
+                .input('ticketId', sql.Int, ticketId)
+                .query(`
+                    SELECT FullName, DateOfBirth, IDNumber, PassengerType
+                    FROM [PassengerDetails] 
+                    WHERE TicketID = @ticketId
+                `);
+        }
         res.json({
             success: true,
             data: {
                 ...order,
-                orderDetails: detailsResult.recordset
+                orderDetails: detailsResult.recordset,
+                passengers: passengerResult.recordset
             }
         });
     } catch (error) {
@@ -301,14 +314,16 @@ exports.updateOrder = async (req, res, next) => {
     }
 };
 
-// Cancel order
+
+/////////////////
+/// HUỶ ĐƠN HÀNG
+/////////////////
 exports.cancelOrder = async (req, res, next) => {
     try {
         const { id } = req.params;
 
         const pool = await getPool();
 
-        // Get order
         const orderResult = await pool.request()
             .input('orderId', sql.Int, id)
             .query('SELECT * FROM [Order] WHERE OrderID = @orderId');
@@ -322,28 +337,24 @@ exports.cancelOrder = async (req, res, next) => {
 
         const order = orderResult.recordset[0];
 
-        // Check authorization
         if (req.user.role !== 'Admin' && order.UserID !== req.user.userId) {
             return res.status(403).json({
                 success: false,
                 message: 'Bạn không có quyền hủy đơn hàng này'
             });
         }
-
-        // Check if order can be cancelled
-        if (order.OrderStatus === 'Completed' || order.OrderStatus === 'Canceled') {
+        if (order.OrderStatus.toLowerCase() !== 'pending') {
             return res.status(400).json({
                 success: false,
-                message: 'Không thể hủy đơn hàng này'
+                message: `Không thể hủy đơn hàng ở trạng thái "${order.OrderStatus}"`
             });
         }
 
-        // Update order status
         await pool.request()
             .input('orderId', sql.Int, id)
             .query(`
         UPDATE [Order] 
-        SET OrderStatus = 'Canceled', IsDeleted = 1, UpdatedDate = GETDATE()
+        SET OrderStatus = 'Cancelled', IsDeleted = 1, UpdatedDate = GETDATE()
         WHERE OrderID = @orderId
       `);
 

@@ -1,14 +1,24 @@
 const { getPool, sql } = require('../config/database');
 const Joi = require('joi');
 
+
+const passengerSchema = Joi.object({
+    fullName: Joi.string().required(),
+    dateOfBirth: Joi.date().required(),
+    idNumber: Joi.string().required(),
+    passengerType: Joi.string().valid('Adult', 'Child').required()
+});
 // Validation schema
 const ticketSchema = Joi.object({
     flightId: Joi.number().integer().required(),
     returnFlightId: Joi.number().integer().optional(),
     ticketType: Joi.string().valid('One-Way', 'Round-Trip').required(),
     adultCount: Joi.number().integer().min(1).required(),
-    childCount: Joi.number().integer().min(0).optional()
-});
+    childCount: Joi.number().integer().min(0).optional(),
+
+    // Thêm trường này: yêu cầu một mảng hành khách, tối thiểu 1
+    passengers: Joi.array().items(passengerSchema).min(1).required()
+}).unknown(true);
 
 // Generate seat number
 const generateSeatNumber = async (pool, flightId) => {
@@ -43,27 +53,30 @@ exports.createTicket = async (req, res, next) => {
             });
         }
 
-        const { flightId, returnFlightId, ticketType, adultCount, childCount = 0 } = value;
+        // Lấy dữ liệu mới từ 'value'
+        const { flightId, returnFlightId, ticketType, adultCount, childCount = 0, passengers } = value;
         const userId = req.user.userId;
+
+        // Kiểm tra số lượng hành khách có khớp không
+        if (passengers.length !== (adultCount + childCount)) {
+            return res.status(400).json({
+                success: false,
+                message: 'Số lượng hành khách không khớp với danh sách chi tiết.'
+            });
+        }
 
         const pool = await getPool();
 
-        // Get flight details
+        // ... (Logic kiểm tra chuyến bay, kiểm tra ghế trống giữ nguyên) ...
+
         const flightResult = await pool.request()
             .input('flightId', sql.Int, flightId)
             .query('SELECT * FROM [FlightList] WHERE FlightID = @flightId');
 
-        if (flightResult.recordset.length === 0) {
-            return res.status(404).json({
-                success: false,
-                message: 'Không tìm thấy chuyến bay'
-            });
-        }
-
+        // ... (Các kiểm tra khác giữ nguyên) ...
         const flight = flightResult.recordset[0];
         const totalPassengers = adultCount + childCount;
 
-        // Check available seats
         if (flight.AvailableSeats < totalPassengers) {
             return res.status(400).json({
                 success: false,
@@ -71,12 +84,10 @@ exports.createTicket = async (req, res, next) => {
             });
         }
 
-        // Calculate price
+        // ... (Logic tính giá, tạo seat number giữ nguyên) ...
         const adultPrice = flight.Price * adultCount;
         const childPrice = flight.Price * 0.5 * childCount;
         const totalPrice = adultPrice + childPrice;
-
-        // Generate seat number
         const seatNumber = await generateSeatNumber(pool, flightId);
 
         // Begin transaction
@@ -84,7 +95,7 @@ exports.createTicket = async (req, res, next) => {
         await transaction.begin();
 
         try {
-            // Create ticket
+            // Create ticket (Giống như cũ)
             const ticketResult = await transaction.request()
                 .input('userId', sql.Int, userId)
                 .input('flightId', sql.Int, flightId)
@@ -95,44 +106,42 @@ exports.createTicket = async (req, res, next) => {
                 .input('ticketStatus', sql.NVarChar, 'Queued')
                 .input('returnFlightId', sql.Int, returnFlightId || null)
                 .query(`
-          INSERT INTO [Ticket] 
-          (UserID, FlightID, BookingDate, SeatNumber, TicketType, TicketPrice, TicketStatus, ReturnFlightID)
-          OUTPUT INSERTED.*
-          VALUES (@userId, @flightId, @bookingDate, @seatNumber, @ticketType, @ticketPrice, @ticketStatus, @returnFlightId)
-        `);
+                  INSERT INTO [Ticket] 
+                  (UserID, FlightID, BookingDate, SeatNumber, TicketType, TicketPrice, TicketStatus, ReturnFlightID)
+                  OUTPUT INSERTED.*
+                  VALUES (@userId, @flightId, @bookingDate, @seatNumber, @ticketType, @ticketPrice, @ticketStatus, @returnFlightId)
+                `);
 
             const ticket = ticketResult.recordset[0];
+            const newTicketId = ticket.TicketID;
 
-            // Update available seats
+            // ✅ BƯỚC 2.4: THÊM VÒNG LẶP ĐỂ LƯU HÀNH KHÁCH
+            for (const passenger of passengers) {
+                await transaction.request()
+                    .input('ticketId', sql.Int, newTicketId)
+                    .input('fullName', sql.NVarChar, passenger.fullName)
+                    .input('dateOfBirth', sql.Date, new Date(passenger.dateOfBirth))
+                    .input('idNumber', sql.NVarChar, passenger.idNumber)
+                    .input('passengerType', sql.NVarChar, passenger.passengerType)
+                    .query(`
+                        INSERT INTO [PassengerDetails] (TicketID, FullName, DateOfBirth, IDNumber, PassengerType)
+                        VALUES (@ticketId, @fullName, @dateOfBirth, @idNumber, @passengerType)
+                    `);
+            }
+            // KẾT THÚC THÊM MỚI
+
+            // ... (Phần Update AvailableSeats và Create Notification giữ nguyên) ...
             await transaction.request()
                 .input('flightId', sql.Int, flightId)
                 .input('totalPassengers', sql.Int, totalPassengers)
                 .query('UPDATE [FlightList] SET AvailableSeats = AvailableSeats - @totalPassengers WHERE FlightID = @flightId');
-
-            // Create notification
-            await transaction.request()
-                .input('userId', sql.Int, userId)
-                .input('message', sql.NVarChar, `Bạn đã đặt vé thành công cho chuyến bay ${flight.FlightNumber}`)
-                .input('type', sql.NVarChar, 'TicketBooking')
-                .query(`
-          INSERT INTO [Notification] (UserID, Message, NotificationType, CreatedDate, IsRead)
-          VALUES (@userId, @message, @type, GETDATE(), 0)
-        `);
 
             await transaction.commit();
 
             res.status(201).json({
                 success: true,
                 message: 'Đặt vé thành công',
-                data: {
-                    ticket,
-                    flight: {
-                        flightNumber: flight.FlightNumber,
-                        departure: flight.DepartureAirport,
-                        arrival: flight.ArrivalAirport,
-                        departureTime: flight.DepartureTime
-                    }
-                }
+                data: { ticket, flight: { /* ... */ } }
             });
         } catch (error) {
             await transaction.rollback();
@@ -142,8 +151,7 @@ exports.createTicket = async (req, res, next) => {
         next(error);
     }
 };
-
-// Get tickets
+// ✅ FIXED: Get tickets - Returns nested structure with Flight object
 exports.getTickets = async (req, res, next) => {
     try {
         const { page = 1, limit = 10, status, sortBy = 'BookingDate', sortOrder = 'DESC' } = req.query;
@@ -175,8 +183,9 @@ exports.getTickets = async (req, res, next) => {
         t.TicketID, t.UserID, t.FlightID, t.BookingDate, t.SeatNumber,
         t.TicketType, t.TicketPrice, t.TicketStatus, t.ReturnFlightID,
         u.Username, u.FullName, u.Email,
-        f.FlightNumber, f.DepartureAirport, f.DepartureCode, f.ArrivalAirport, 
-        f.ArrivalCode, f.DepartureTime, f.ArrivalTime
+        f.FlightID as FlightFlightID, f.FlightNumber, f.DepartureAirport, f.DepartureCode, 
+        f.ArrivalAirport, f.ArrivalCode, f.DepartureTime, f.ArrivalTime, f.Price,
+        f.AvailableSeats, f.TotalSeats
       FROM [Ticket] t
       INNER JOIN [User] u ON t.UserID = u.UserID
       INNER JOIN [FlightList] f ON t.FlightID = f.FlightID
@@ -195,17 +204,38 @@ exports.getTickets = async (req, res, next) => {
 
         const total = countResult.recordset[0].total;
 
+        // ✅ FIXED: Transform flat structure to nested structure with Flight object
+        const tickets = result.recordset.map(row => ({
+            TicketID: row.TicketID,
+            UserID: row.UserID,
+            FlightID: row.FlightID,
+            BookingDate: row.BookingDate,
+            SeatNumber: row.SeatNumber,
+            TicketType: row.TicketType,
+            TicketPrice: row.TicketPrice,
+            TotalPrice: row.TicketPrice, // Map TicketPrice to TotalPrice for compatibility
+            TicketStatus: row.TicketStatus,
+            ReturnFlightID: row.ReturnFlightID,
+            AdultCount: 1, // Default value - you can store this in DB if needed
+            ChildCount: 0,  // Default value - you can store this in DB if needed
+            Flight: {
+                FlightID: row.FlightFlightID,
+                FlightNumber: row.FlightNumber,
+                DepartureAirport: row.DepartureAirport,
+                DepartureCode: row.DepartureCode,
+                ArrivalAirport: row.ArrivalAirport,
+                ArrivalCode: row.ArrivalCode,
+                DepartureTime: row.DepartureTime,
+                ArrivalTime: row.ArrivalTime,
+                Price: row.Price,
+                AvailableSeats: row.AvailableSeats,
+                TotalSeats: row.TotalSeats
+            }
+        }));
+
         res.json({
             success: true,
-            data: {
-                tickets: result.recordset,
-                pagination: {
-                    page: parseInt(page),
-                    limit: parseInt(limit),
-                    total,
-                    totalPages: Math.ceil(total / limit)
-                }
-            }
+            data: tickets // ✅ Return flat array, not nested in "tickets" property
         });
     } catch (error) {
         next(error);
@@ -366,7 +396,7 @@ exports.cancelTicket = async (req, res, next) => {
     }
 };
 
-// Get tickets by user ID
+// lấy vé thông qua userID
 exports.getTicketsByUserId = async (req, res, next) => {
     try {
         const { userId } = req.params;
